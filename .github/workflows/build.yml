@@ -1,0 +1,86 @@
+# Cross-compiles the Node.js runtime bundled in the gSender Pendant for Android
+# and publishes it as a release of this repo. gSender's Android workflow
+# (.github/workflows/android.yml) downloads the release whose tag matches its
+# android/node/ (see android/scripts/node-runtime-tag.sh in gSender).
+#
+# Run this whenever gSender changes anything in android/node/. It skips the
+# build if a release with that tag already exists.
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      gsender_ref:
+        description: gSender branch, tag or commit to build the runtime from
+        default: dev
+        required: true
+
+# One build per gSender ref, and never cancel one in progress: a cancelled
+# 1.5 h build is wasted.
+concurrency:
+  group: build-${{ inputs.gsender_ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  node-runtime:
+    name: Node runtime arm64
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Sienci-Labs/gsender
+          ref: ${{ inputs.gsender_ref }}
+          path: gsender
+
+      - name: Resolve release tag
+        id: env
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          source gsender/android/node/runtime.env
+          tag=$(bash gsender/android/scripts/node-runtime-tag.sh)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "ndk=$NDK_VERSION" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git -C gsender rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "### $tag is already published, nothing to build" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Set up NDK
+        if: steps.env.outputs.exists != 'true'
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ steps.env.outputs.ndk }}
+          add-to-path: false
+
+      - name: Free disk space
+        if: steps.env.outputs.exists != 'true'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk/ndk /opt/ghc /usr/local/.ghcup && df -h /
+
+      - name: Cross-compile Node (1–1.5 h)
+        if: steps.env.outputs.exists != 'true'
+        run: bash gsender/android/node/build-node.sh arm64 "${{ steps.ndk.outputs.ndk-path }}" "$RUNNER_TEMP/node-work" "$RUNNER_TEMP/node-runtime"
+
+      - name: Publish release
+        if: steps.env.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.env.outputs.tag }}
+          SHA: ${{ steps.env.outputs.sha }}
+        run: |
+          cd "$RUNNER_TEMP/node-runtime"
+          {
+            echo "Built from Sienci-Labs/gsender@$SHA (${{ inputs.gsender_ref }})."
+            echo
+            echo '```'
+            tar xzf ./*.tar.gz -O ./build-info.txt
+            echo '```'
+          } > notes.md
+          gh release create "$TAG" ./*.tar.gz ./*.sha256 -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "$TAG" --notes-file notes.md
+          cat notes.md >> "$GITHUB_STEP_SUMMARY"
